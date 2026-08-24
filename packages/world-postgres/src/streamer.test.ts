@@ -62,16 +62,6 @@ function createDrizzle(selectResults: SelectResult[]) {
   };
 }
 
-function createDeferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, reject, resolve };
-}
-
 async function getNotificationHandler(): Promise<NotificationHandler> {
   await vi.waitFor(() => {
     expect(notificationHandlers.size).toBe(1);
@@ -153,6 +143,10 @@ describe('Postgres stream reader cleanup', () => {
     const notificationHandler = await getNotificationHandler();
     const stream = await streamer.streams.get('run-1', streamId);
     const reader = stream.getReader();
+
+    // Let the initial empty query finish so this exercises the live listener
+    // rather than the startup buffer used to bridge query/NOTIFY races.
+    await flushNotificationWork();
     const pendingRead = reader.read();
 
     notificationHandler({
@@ -238,18 +232,15 @@ describe('Postgres stream reader cleanup', () => {
 
   it('retains explicit consumer cancellation cleanup', async () => {
     const streamId = 'stream-cancel';
-    const pendingQuery = createDeferred<unknown[]>();
-    const { drizzle, select } = createDrizzle([pendingQuery.promise]);
+    const { drizzle, select } = createDrizzle([[]]);
     const streamer = createStreamer(pool, drizzle);
     const notificationHandler = await getNotificationHandler();
     const stream = await streamer.streams.get('run-1', streamId);
     const reader = stream.getReader();
 
+    await flushNotificationWork();
     await reader.cancel();
     await expectNotificationIgnored(notificationHandler, select, streamId);
-
-    pendingQuery.resolve([]);
-    await flushNotificationWork();
     await streamer.close();
   });
 });
