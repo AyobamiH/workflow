@@ -93,6 +93,7 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
   const { streams } = Schema;
   const genChunkId = () => `chnk_${ulid()}` as const;
   const mutexes = new Map<string, Rc<{ drop(): void; mutex: Mutex }>>();
+  const activeReaderCleanups = new Set<() => void>();
   const getMutex = (key: string) => {
     let mutex = mutexes.get(key);
     if (!mutex) {
@@ -352,7 +353,7 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
         name: string,
         startIndex?: number
       ): Promise<ReadableStream<Uint8Array>> {
-        const cleanups: (() => void)[] = [];
+        let cleanupReader: (() => void) | undefined;
 
         return new ReadableStream<Uint8Array>({
           async start(controller) {
@@ -361,14 +362,26 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
             let lastChunkId = '';
             let offset = startIndex ?? 0;
             let buffer = [] as StreamChunkEvent[] | null;
+            const key = `strm:${name}` as const;
+            let cleanedUp = false;
+
+            function cleanup() {
+              if (cleanedUp) {
+                return;
+              }
+              cleanedUp = true;
+              events.off(key, onData);
+              activeReaderCleanups.delete(cleanup);
+            }
+            cleanupReader = cleanup;
 
             function enqueue(msg: {
               id: string;
               data: Uint8Array;
               eof: boolean;
             }) {
-              if (lastChunkId >= msg.id) {
-                // already sent or out of order
+              if (cleanedUp || lastChunkId >= msg.id) {
+                // already sent, out of order, or the reader is no longer active
                 return;
               }
 
@@ -381,6 +394,7 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
                 controller.enqueue(new Uint8Array(msg.data));
               }
               if (msg.eof) {
+                cleanup();
                 controller.close();
               }
               lastChunkId = msg.id;
@@ -393,38 +407,42 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
               }
               enqueue(data);
             }
-            events.on(`strm:${name}`, onData);
-            cleanups.push(() => {
-              events.off(`strm:${name}`, onData);
-            });
 
-            const chunks = await drizzle
-              .select({
-                id: streams.chunkId,
-                eof: streams.eof,
-                data: streams.chunkData,
-              })
-              .from(streams)
-              .where(and(eq(streams.streamId, name)))
-              .orderBy(streams.chunkId);
+            events.on(key, onData);
+            activeReaderCleanups.add(cleanup);
 
-            // Resolve negative offset relative to the data chunk count
-            // (excluding the trailing EOF marker, if present)
-            if (typeof offset === 'number' && offset < 0) {
-              const dataCount =
-                chunks.length > 0 && chunks[chunks.length - 1].eof
-                  ? chunks.length - 1
-                  : chunks.length;
-              offset = Math.max(0, dataCount + offset);
+            try {
+              const chunks = await drizzle
+                .select({
+                  id: streams.chunkId,
+                  eof: streams.eof,
+                  data: streams.chunkData,
+                })
+                .from(streams)
+                .where(and(eq(streams.streamId, name)))
+                .orderBy(streams.chunkId);
+
+              // Resolve negative offset relative to the data chunk count
+              // (excluding the trailing EOF marker, if present)
+              if (typeof offset === 'number' && offset < 0) {
+                const dataCount =
+                  chunks.length > 0 && chunks[chunks.length - 1].eof
+                    ? chunks.length - 1
+                    : chunks.length;
+                offset = Math.max(0, dataCount + offset);
+              }
+
+              for (const chunk of [...chunks, ...(buffer ?? [])]) {
+                enqueue(chunk);
+              }
+              buffer = null;
+            } catch (error) {
+              cleanup();
+              throw error;
             }
-
-            for (const chunk of [...chunks, ...(buffer ?? [])]) {
-              enqueue(chunk);
-            }
-            buffer = null;
           },
           cancel() {
-            cleanups.forEach((fn) => void fn());
+            cleanupReader?.();
           },
         });
       },
@@ -441,6 +459,12 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
     },
 
     async close() {
+      // Readers own EventEmitter subscriptions independent of the PostgreSQL
+      // LISTEN client. Release those subscriptions before shutting it down.
+      for (const cleanup of [...activeReaderCleanups]) {
+        cleanup();
+      }
+
       const sub = await listenSubscription.catch(() => undefined);
       if (sub) await sub.close();
     },
