@@ -2,4 +2,4 @@
 '@workflow/world-postgres': patch
 ---
 
-Release Postgres stream reader listeners when reads finish, fail, are cancelled, or the World closes.
+Clean up Postgres stream reader listeners on EOF, query failure, cancellation, and World shutdown. Closing the streamer now resolves active readers and prevents new readers from attaching to the closed subscription.
