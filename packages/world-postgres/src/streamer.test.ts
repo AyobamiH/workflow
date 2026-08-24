@@ -47,11 +47,11 @@ function createDrizzle(selectResults: SelectResult[]) {
     chain.then = (
       onFulfilled: (value: unknown[]) => unknown,
       onRejected: (error: unknown) => unknown
-    ) =>
-      (result instanceof Error ? Promise.reject(result) : Promise.resolve(result)).then(
-        onFulfilled,
-        onRejected
-      );
+    ) => {
+      const promise =
+        result instanceof Error ? Promise.reject(result) : Promise.resolve(result);
+      return promise.then(onFulfilled, onRejected);
+    };
 
     return chain;
   });
@@ -76,7 +76,12 @@ async function getNotificationHandler(): Promise<NotificationHandler> {
   await vi.waitFor(() => {
     expect(notificationHandlers.size).toBe(1);
   });
-  return [...notificationHandlers][0];
+
+  const [handler] = notificationHandlers;
+  if (!handler) {
+    throw new Error('notification handler was not registered');
+  }
+  return handler;
 }
 
 async function flushNotificationWork(): Promise<void> {
@@ -122,15 +127,46 @@ describe('Postgres stream reader cleanup', () => {
           eof: true,
         },
       ],
-      [],
     ]);
     const streamer = createStreamer(pool, drizzle);
     const notificationHandler = await getNotificationHandler();
     const stream = await streamer.streams.get('run-1', streamId);
     const reader = stream.getReader();
 
-    await expect(reader.read()).resolves.toEqual({ done: true, value: undefined });
+    await expect(reader.read()).resolves.toEqual({
+      done: true,
+      value: undefined,
+    });
     expect(select).toHaveBeenCalledTimes(1);
+
+    await expectNotificationIgnored(notificationHandler, select, streamId);
+    await streamer.close();
+  });
+
+  it('removes the reader listener when live EOF arrives via NOTIFY', async () => {
+    const streamId = 'stream-live-eof';
+    const { drizzle, select } = createDrizzle([
+      [],
+      [{ data: Buffer.from([]), eof: true }],
+    ]);
+    const streamer = createStreamer(pool, drizzle);
+    const notificationHandler = await getNotificationHandler();
+    const stream = await streamer.streams.get('run-1', streamId);
+    const reader = stream.getReader();
+    const pendingRead = reader.read();
+
+    notificationHandler({
+      payload: JSON.stringify({
+        streamId,
+        chunkId: 'chnk_01KLIVEEOF',
+      }),
+    });
+
+    await expect(pendingRead).resolves.toEqual({
+      done: true,
+      value: undefined,
+    });
+    expect(select).toHaveBeenCalledTimes(2);
 
     await expectNotificationIgnored(notificationHandler, select, streamId);
     await streamer.close();
@@ -139,7 +175,7 @@ describe('Postgres stream reader cleanup', () => {
   it('removes the reader listener when the initial stream query fails', async () => {
     const streamId = 'stream-query-error';
     const queryError = new Error('stream query failed');
-    const { drizzle, select } = createDrizzle([queryError, []]);
+    const { drizzle, select } = createDrizzle([queryError]);
     const streamer = createStreamer(pool, drizzle);
     const notificationHandler = await getNotificationHandler();
     const stream = await streamer.streams.get('run-1', streamId);
@@ -152,20 +188,68 @@ describe('Postgres stream reader cleanup', () => {
     await streamer.close();
   });
 
-  it('removes active reader listeners when the streamer closes', async () => {
+  it('closes pending readers and removes their listeners on shutdown', async () => {
     const streamId = 'stream-world-close';
-    const pendingQuery = createDeferred<unknown[]>();
-    const { drizzle, select } = createDrizzle([pendingQuery.promise, []]);
+    const { drizzle, select } = createDrizzle([
+      [
+        {
+          id: 'chnk_01KDATA',
+          data: Buffer.from('hello'),
+          eof: false,
+        },
+      ],
+    ]);
+    const streamer = createStreamer(pool, drizzle);
+    const notificationHandler = await getNotificationHandler();
+    const stream = await streamer.streams.get('run-1', streamId);
+    const reader = stream.getReader();
+
+    await expect(reader.read()).resolves.toEqual({
+      done: false,
+      value: new Uint8Array(Buffer.from('hello')),
+    });
+    const pendingRead = reader.read();
+
+    await streamer.close();
+    await expect(pendingRead).resolves.toEqual({
+      done: true,
+      value: undefined,
+    });
+    await expectNotificationIgnored(notificationHandler, select, streamId);
+  });
+
+  it('does not register new readers after shutdown', async () => {
+    const streamId = 'stream-after-close';
+    const { drizzle, select } = createDrizzle([]);
     const streamer = createStreamer(pool, drizzle);
     const notificationHandler = await getNotificationHandler();
 
-    await streamer.streams.get('run-1', streamId);
-    expect(select).toHaveBeenCalledTimes(1);
-
     await streamer.close();
+
+    const stream = await streamer.streams.get('run-1', streamId);
+    const reader = stream.getReader();
+    await expect(reader.read()).resolves.toEqual({
+      done: true,
+      value: undefined,
+    });
+    expect(select).not.toHaveBeenCalled();
+    await expectNotificationIgnored(notificationHandler, select, streamId);
+  });
+
+  it('retains explicit consumer cancellation cleanup', async () => {
+    const streamId = 'stream-cancel';
+    const pendingQuery = createDeferred<unknown[]>();
+    const { drizzle, select } = createDrizzle([pendingQuery.promise]);
+    const streamer = createStreamer(pool, drizzle);
+    const notificationHandler = await getNotificationHandler();
+    const stream = await streamer.streams.get('run-1', streamId);
+    const reader = stream.getReader();
+
+    await reader.cancel();
     await expectNotificationIgnored(notificationHandler, select, streamId);
 
     pendingQuery.resolve([]);
     await flushNotificationWork();
+    await streamer.close();
   });
 });
