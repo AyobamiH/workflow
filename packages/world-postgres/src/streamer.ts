@@ -93,7 +93,8 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
   const { streams } = Schema;
   const genChunkId = () => `chnk_${ulid()}` as const;
   const mutexes = new Map<string, Rc<{ drop(): void; mutex: Mutex }>>();
-  const activeReaderCleanups = new Set<() => void>();
+  const activeReaderClosers = new Set<() => void>();
+  let closed = false;
   const getMutex = (key: string) => {
     let mutex = mutexes.get(key);
     if (!mutex) {
@@ -353,6 +354,14 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
         name: string,
         startIndex?: number
       ): Promise<ReadableStream<Uint8Array>> {
+        if (closed) {
+          return new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.close();
+            },
+          });
+        }
+
         let cleanupReader: (() => void) | undefined;
 
         return new ReadableStream<Uint8Array>({
@@ -364,6 +373,7 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
             let buffer = [] as StreamChunkEvent[] | null;
             const key = `strm:${name}` as const;
             let cleanedUp = false;
+            let closeReader!: () => void;
 
             function cleanup() {
               if (cleanedUp) {
@@ -371,8 +381,16 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
               }
               cleanedUp = true;
               events.off(key, onData);
-              activeReaderCleanups.delete(cleanup);
+              activeReaderClosers.delete(closeReader);
             }
+
+            closeReader = () => {
+              if (cleanedUp) {
+                return;
+              }
+              cleanup();
+              controller.close();
+            };
             cleanupReader = cleanup;
 
             function enqueue(msg: {
@@ -394,8 +412,7 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
                 controller.enqueue(new Uint8Array(msg.data));
               }
               if (msg.eof) {
-                cleanup();
-                controller.close();
+                closeReader();
               }
               lastChunkId = msg.id;
             }
@@ -409,7 +426,7 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
             }
 
             events.on(key, onData);
-            activeReaderCleanups.add(cleanup);
+            activeReaderClosers.add(closeReader);
 
             try {
               const chunks = await drizzle
@@ -438,6 +455,9 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
               buffer = null;
             } catch (error) {
               cleanup();
+              if (closed) {
+                return;
+              }
               throw error;
             }
           },
@@ -459,10 +479,15 @@ export function createStreamer(pool: Pool, drizzle: Drizzle): PostgresStreamer {
     },
 
     async close() {
-      // Readers own EventEmitter subscriptions independent of the PostgreSQL
-      // LISTEN client. Release those subscriptions before shutting it down.
-      for (const cleanup of [...activeReaderCleanups]) {
-        cleanup();
+      if (closed) {
+        return;
+      }
+      closed = true;
+
+      // Closing the streamer is terminal for active readers. Resolve any
+      // outstanding reads before shutting down the PostgreSQL subscription.
+      for (const closeReader of [...activeReaderClosers]) {
+        closeReader();
       }
 
       const sub = await listenSubscription.catch(() => undefined);
