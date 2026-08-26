@@ -40,18 +40,16 @@ function createDrizzle(selectResults: SelectResult[]) {
     const result = selectResults.shift() ?? [];
     const chain: Record<string, unknown> = {};
 
+    function resolveResult(): Promise<unknown[]> {
+      return result instanceof Error
+        ? Promise.reject(result)
+        : Promise.resolve(result);
+    }
+
     chain.from = vi.fn(() => chain);
     chain.where = vi.fn(() => chain);
-    chain.orderBy = vi.fn(() => chain);
-    chain.limit = vi.fn(() => chain);
-    chain.then = (
-      onFulfilled: (value: unknown[]) => unknown,
-      onRejected: (error: unknown) => unknown
-    ) => {
-      const promise =
-        result instanceof Error ? Promise.reject(result) : Promise.resolve(result);
-      return promise.then(onFulfilled, onRejected);
-    };
+    chain.orderBy = vi.fn(resolveResult);
+    chain.limit = vi.fn(resolveResult);
 
     return chain;
   });
