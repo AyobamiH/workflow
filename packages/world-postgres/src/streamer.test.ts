@@ -74,8 +74,16 @@ describe('postgres streamer reader listener cleanup', () => {
 
   it('removes the listener when a persisted EOF closes the stream', async () => {
     const drizzle = createFakeDrizzle(async () => [
-      { id: 'chnk_00000000000000000000000001', eof: false, data: Buffer.from('hello') },
-      { id: 'chnk_00000000000000000000000002', eof: true, data: Buffer.from([]) },
+      {
+        id: 'chnk_00000000000000000000000001',
+        eof: false,
+        data: Buffer.from('hello'),
+      },
+      {
+        id: 'chnk_00000000000000000000000002',
+        eof: true,
+        data: Buffer.from([]),
+      },
     ]);
     const streamer = createStreamer(fakePool, drizzle);
 
@@ -108,6 +116,36 @@ describe('postgres streamer reader listener cleanup', () => {
     }
   });
 
+  it('removes the listener when live EOF arrives through the stream emitter', async () => {
+    const drizzle = createFakeDrizzle(async () => []);
+    const streamer = createStreamer(fakePool, drizzle);
+    const streamName = 'stream-live-eof';
+
+    try {
+      const stream = await streamer.streams.get('run_1', streamName);
+      const reader = stream.getReader();
+      expect(listenerCount(streamName)).toBe(1);
+
+      // Let the initial query finish so this reaches the live-event path.
+      await new Promise((resolve) => setImmediate(resolve));
+      for (const emitter of streamEmitters) {
+        emitter.emit(`strm:${streamName}`, {
+          id: 'chnk_00000000000000000000000003',
+          eof: true,
+          data: Buffer.from([]),
+        });
+      }
+
+      await expect(reader.read()).resolves.toEqual({
+        done: true,
+        value: undefined,
+      });
+      expect(listenerCount(streamName)).toBe(0);
+    } finally {
+      await streamer.close();
+    }
+  });
+
   it('removes the listener when the initial chunk query rejects', async () => {
     const drizzle = createFakeDrizzle(async () => {
       throw new Error('initial query failed');
@@ -126,10 +164,14 @@ describe('postgres streamer reader listener cleanup', () => {
     }
   });
 
-  it('detaches active readers when the streamer is closed', async () => {
+  it('closes pending readers and detaches listeners when the streamer closes', async () => {
     // No EOF chunk: readers stay open, tailing live events.
     const drizzle = createFakeDrizzle(async () => [
-      { id: 'chnk_00000000000000000000000001', eof: false, data: Buffer.from('hello') },
+      {
+        id: 'chnk_00000000000000000000000001',
+        eof: false,
+        data: Buffer.from('hello'),
+      },
     ]);
     const streamer = createStreamer(fakePool, drizzle);
 
@@ -142,8 +184,27 @@ describe('postgres streamer reader listener cleanup', () => {
     }
     expect(listenerCount('stream-open')).toBe(10);
 
+    const pendingReads = readers.map((reader) => reader.read());
     await streamer.close();
     expect(listenerCount('stream-open')).toBe(0);
+    await expect(Promise.all(pendingReads)).resolves.toEqual(
+      Array.from({ length: 10 }, () => ({ done: true, value: undefined }))
+    );
+  });
+
+  it('does not register new readers after the streamer closes', async () => {
+    const drizzle = createFakeDrizzle(async () => []);
+    const streamer = createStreamer(fakePool, drizzle);
+
+    await streamer.close();
+
+    const stream = await streamer.streams.get('run_1', 'stream-after-close');
+    const reader = stream.getReader();
+    await expect(reader.read()).resolves.toEqual({
+      done: true,
+      value: undefined,
+    });
+    expect(listenerCount('stream-after-close')).toBe(0);
   });
 
   it('still cleans up on explicit consumer cancellation', async () => {
